@@ -38,6 +38,7 @@
 - [Are there community projects involving code-server?](#are-there-community-projects-involving-code-server)
 - [How do I change the port?](#how-do-i-change-the-port)
 - [How do I hide the coder/coder promotion in Help: Getting Started?](#how-do-i-hide-the-codercoder-promotion-in-help-getting-started)
+- [How do I add custom menu items?](#how-do-i-add-custom-menu-items)
 - [How do I disable the proxy?](#how-do-i-disable-the-proxy)
 - [How do I disable file download?](#how-do-i-disable-file-download)
 - [Why do web views not work?](#why-do-web-views-not-work)
@@ -524,6 +525,57 @@ There are two ways to change the port on which code-server runs:
 You can pass the flag `--disable-getting-started-override` to `code-server` or
 you can set the environment variable `CS_DISABLE_GETTING_STARTED_OVERRIDE=1` or
 `CS_DISABLE_GETTING_STARTED_OVERRIDE=true`.
+
+## How do I add custom menu items?
+
+You can add your own menu items to the File, Go and Help menubar menus by
+passing a YAML file via `--custom-menu-file`:
+
+```
+code-server --custom-menu-file ./custom-menus.yaml
+```
+
+The flag can also be set in the [config file](#how-does-the-config-file-work)
+as `custom-menu-file: <path>`. The file is read once when the server starts;
+changes require a restart. If the flag is not set, no custom menus are added.
+
+The file must contain a `custom-menus` list. Each entry targets one menu
+(`file`, `go` or `help`) and contains one or more `groups`. A group is
+positioned at the `top` or `bottom` of the menu (default `bottom`), and its
+entries keep their declared order. Each new group is rendered as a separate
+block, separated from the next one by a divider. An entry requires a `name`
+(either a plain string, or a map keyed by locale) and a `link` (a relative
+path such as `/home`, or an absolute URL):
+
+```yaml
+custom-menus:
+  - menu: file
+    groups:
+      - position: top
+        entries:
+          - name:
+              en: "Go Home"
+              zh-cn: "回主页"
+            link: /
+          - name: "Index"
+            link: /index
+      - position: bottom
+        entries:
+          - name:
+              en: "Online Documentation"
+              zh-cn: "在线文档"
+            link: https://coder.com/docs/code-server
+  - menu: help
+    groups:
+      - entries:
+          - name: "Report an Issue"
+            link: https://github.com/coder/code-server/issues
+```
+
+Labels are resolved against the UI language at runtime in this order:
+exact locale (e.g. `zh-cn`), language prefix (e.g. `zh`), a plain-string
+label (any locale), `en`, then the first declared key. Invalid entries are
+skipped with a warning logged by the server; the server keeps the rest.
 
 ## How do I disable the proxy?
 

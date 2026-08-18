@@ -1,0 +1,422 @@
+Custom menus for code-server
+
+Add configurable menu items to the File, Go and Help menubar menus from a
+YAML file passed via `--custom-menu-file`. Each entry targets one menu
+(`file`, `go` or `help`) and contains one or more groups. A group is
+positioned at the top or bottom of the menu (default `bottom`); its
+entries keep their declared order and each new group is rendered as a
+separate block, separated from the next by a divider. Entry labels can be
+localized per UI language and link to a relative path or absolute URL.
+
+Index: code-server/lib/vscode/src/vs/base/common/product.ts
+===================================================================
+--- code-server.orig/lib/vscode/src/vs/base/common/product.ts
++++ code-server/lib/vscode/src/vs/base/common/product.ts
+@@ -96,11 +96,30 @@ export interface IDictationRuntimeProduc
+ 	readonly urlTemplate: string;
+ }
+ 
++/**
++ * A custom menu entry configured via the `--custom-menu-file` YAML file.
++ */
++export interface ICustomMenuEntry {
++	readonly names: Record<string, string>;
++	readonly link: string;
++}
++
++export interface ICustomMenuGroup {
++	readonly position: 'top' | 'bottom';
++	readonly entries: ReadonlyArray<ICustomMenuEntry>;
++}
++
++export interface ICustomMenu {
++	readonly menu: 'file' | 'go' | 'help';
++	readonly groups: ReadonlyArray<ICustomMenuGroup>;
++}
++
+ export interface IProductConfiguration {
+ 	readonly codeServerVersion?: string
+ 	readonly rootEndpoint?: string
+ 	readonly updateEndpoint?: string
+ 	readonly logoutEndpoint?: string
++	readonly customMenus?: ReadonlyArray<ICustomMenu>
+ 	readonly proxyEndpointTemplate?: string
+ 	readonly serviceWorker?: {
+ 		readonly path: string;
+Index: code-server/lib/vscode/src/vs/server/node/serverEnvironmentService.ts
+===================================================================
+--- code-server.orig/lib/vscode/src/vs/server/node/serverEnvironmentService.ts
++++ code-server/lib/vscode/src/vs/server/node/serverEnvironmentService.ts
+@@ -67,6 +67,7 @@ export const serverOptions: OptionDescri
+ 	'github-auth': { type: 'string' },
+ 	'use-test-resolver': { type: 'boolean' },
+ 	'enable-remote-storage': { type: 'boolean', cat: 'o', description: nls.localize('enable-remote-storage', 'Persist browser storage (settings, state, etc.) on the server instead of browser IndexedDB. Enables state portability across browsers/devices.') },
++	'custom-menu-file': { type: 'string', cat: 'o', args: 'file', description: nls.localize('custom-menu-file', "Path to a YAML file that describes custom menu items for the File, Go and Help menus.") },
+ 
+ 	/* ----- extension management ----- */
+ 
+@@ -128,6 +129,7 @@ export interface ServerParsedArgs {
+ 	'link-protection-trusted-domains'?: string[],
+ 	'app-name'?: string,
+ 	'enable-remote-storage'?: boolean,
++	'custom-menu-file'?: string
+ 
+ 	/* ----- server setup ----- */
+ 
+Index: code-server/lib/vscode/src/vs/server/node/webClientServer.ts
+===================================================================
+--- code-server.orig/lib/vscode/src/vs/server/node/webClientServer.ts
++++ code-server/lib/vscode/src/vs/server/node/webClientServer.ts
+@@ -23,7 +23,8 @@ import { IHeaders } from '../../base/par
+ import { CancellationToken } from '../../base/common/cancellation.js';
+ import { URI } from '../../base/common/uri.js';
+ import { streamToBuffer } from '../../base/common/buffer.js';
+-import { IProductConfiguration } from '../../base/common/product.js';
++import { ICustomMenu, ICustomMenuEntry, ICustomMenuGroup, IProductConfiguration } from '../../base/common/product.js';
++import { load as loadYaml } from 'js-yaml';
+ import { isString, Mutable } from '../../base/common/types.js';
+ import { getLocaleFromConfig, getBrowserNLSConfiguration } from './remoteLanguagePacks.js';
+ import { CharCode } from '../../base/common/charCode.js';
+@@ -119,6 +120,7 @@ const WEB_EXTENSION_PATH = `/web-extensi
+ export class WebClientServer {
+ 
+ 	private readonly _webExtensionResourceUrlTemplate: URI | undefined;
++	private readonly customMenusPromise = this.loadCustomMenus();
+ 
+ 	constructor(
+ 		private readonly _connectionToken: ServerConnectionToken,
+@@ -256,6 +258,170 @@ export class WebClientServer {
+ 	}
+ 
+ 	/**
++	 * Custom menus are read once (lazily) from the file given via
++	 * `--custom-menu-file` and cached for the lifetime of the server.
++	 */
++	private async loadCustomMenus(): Promise<ReadonlyArray<ICustomMenu> | undefined> {
++		const customMenusFile = this._environmentService.args['custom-menu-file'];
++		if (!customMenusFile) {
++			return undefined;
++		}
++
++		let content: string;
++		try {
++			content = (await promises.readFile(customMenusFile)).toString();
++		} catch (error) {
++			this._logService.error(`[custom menus] Unable to read custom menus file '${customMenusFile}': ${error}`);
++			return undefined;
++		}
++
++		let parsed: unknown;
++		try {
++			parsed = loadYaml(content);
++		} catch (error) {
++			this._logService.error(`[custom menus] Unable to parse YAML from '${customMenusFile}': ${error}`);
++			return undefined;
++		}
++
++		if (typeof parsed !== 'object' || parsed === null) {
++			this._logService.error(`[custom menus] '${customMenusFile}' must contain a 'custom-menus' list`);
++			return undefined;
++		}
++
++		const rawMenus = (parsed as Record<string, unknown>)['custom-menus'];
++		if (!Array.isArray(rawMenus)) {
++			this._logService.error(`[custom menus] '${customMenusFile}' must contain a 'custom-menus' list`);
++			return undefined;
++		}
++
++		const menus: ICustomMenu[] = [];
++		for (const rawMenu of rawMenus) {
++			const menu = this.parseCustomMenu(rawMenu);
++			if (menu) {
++				menus.push(menu);
++			}
++		}
++
++		if (menus.length === 0) {
++			this._logService.warn(`[custom menus] No valid menu entries found in '${customMenusFile}'`);
++		} else {
++			this._logService.info(`[custom menus] Loaded ${menus.map(menu => menu.menu).join(', ')} menus from '${customMenusFile}'`);
++		}
++
++		return menus;
++	}
++
++	private parseCustomMenu(raw: unknown): ICustomMenu | undefined {
++		if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
++			return undefined;
++		}
++
++		const menu = (raw as Record<string, unknown>)['menu'];
++		if (menu !== 'file' && menu !== 'go' && menu !== 'help') {
++			this._logService.warn(`[custom menus] Unknown menu '${String(menu)}', expected file, go or help. Skipping entry`);
++			return undefined;
++		}
++
++		const rawGroups = (raw as Record<string, unknown>)['groups'];
++		if (!Array.isArray(rawGroups)) {
++			this._logService.warn(`[custom menus] Menu '${menu}' has no 'groups' list. Skipping entry`);
++			return undefined;
++		}
++
++		const groups: ICustomMenuGroup[] = [];
++		for (const rawGroup of rawGroups) {
++			const group = this.parseCustomMenuGroup(rawGroup);
++			if (group) {
++				groups.push(group);
++			}
++		}
++
++		if (groups.length === 0) {
++			return undefined;
++		}
++
++		return { menu, groups };
++	}
++
++	private parseCustomMenuGroup(raw: unknown): ICustomMenuGroup | undefined {
++		if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
++			return undefined;
++		}
++
++		const obj = raw as Record<string, unknown>;
++
++		// position defaults to 'bottom'
++		let position: 'top' | 'bottom';
++		if (obj['position'] === undefined) {
++			position = 'bottom';
++		} else if (obj['position'] === 'top' || obj['position'] === 'bottom') {
++			position = obj['position'];
++		} else {
++			this._logService.warn(`[custom menus] Unknown position '${String(obj['position'])}', expected top or bottom. Skipping group`);
++			return undefined;
++		}
++
++		if (!Array.isArray(obj['entries'])) {
++			this._logService.warn('[custom menus] Group has no entries list. Skipping group');
++			return undefined;
++		}
++
++		const entries: ICustomMenuEntry[] = [];
++		for (const rawEntry of obj['entries']) {
++			const entry = this.parseCustomMenuEntry(rawEntry);
++			if (entry) {
++				entries.push(entry);
++			} else {
++				this._logService.warn('[custom menus] Invalid menu entry (requires a non-empty name and link). Skipping entry');
++			}
++		}
++
++		if (entries.length === 0) {
++			return undefined; // empty groups render nothing
++		}
++
++		return { position, entries };
++	}
++
++	private parseCustomMenuEntry(raw: unknown): ICustomMenuEntry | undefined {
++		if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
++			return undefined;
++		}
++
++		const obj = raw as Record<string, unknown>;
++
++		const names = this.parseCustomMenuNames(obj['name']);
++		const link = obj['link'];
++		if (!names || typeof link !== 'string' || link === '') {
++			return undefined;
++		}
++
++		return { names, link };
++	}
++
++	/**
++	 * A plain string applies to any locale; a map is keyed by locale.
++	 */
++	private parseCustomMenuNames(raw: unknown): Record<string, string> | undefined {
++		if (typeof raw === 'string' && raw !== '') {
++			return { '*': raw };
++		}
++
++		if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
++			return undefined;
++		}
++
++		const names: Record<string, string> = {};
++		for (const [locale, name] of Object.entries(raw)) {
++			if (typeof name === 'string' && name !== '') {
++				names[locale] = name;
++			}
++		}
++
++		return Object.keys(names).length > 0 ? names : undefined;
++	}
++
++	/**
+ 	 * Handle HTTP requests for /
+ 	 */
+ 	private async _handleRoot(req: http.IncomingMessage, res: http.ServerResponse, parsedUrl: url.UrlWithParsedQuery): Promise<void> {
+@@ -375,6 +541,7 @@ export class WebClientServer {
+ 			updateEndpoint: !this._environmentService.args['disable-update-check'] ? rootBase + '/update/check' : undefined,
+ 			logoutEndpoint: this._environmentService.args['auth'] && this._environmentService.args['auth'] !== "none" ? rootBase + '/logout' : undefined,
+ 			proxyEndpointTemplate: process.env.VSCODE_PROXY_URI ?? rootBase + '/proxy/{{port}}/',
++			customMenus: await this.customMenusPromise,
+ 			serviceWorker: {
+ 				scope: vscodeBase + '/',
+ 				path: rootBase + '/_static/out/browser/serviceWorker.js',
+Index: code-server/lib/vscode/src/vs/workbench/browser/client.ts
+===================================================================
+--- code-server.orig/lib/vscode/src/vs/workbench/browser/client.ts
++++ code-server/lib/vscode/src/vs/workbench/browser/client.ts
+@@ -6,9 +6,12 @@ import { ILogService } from '../../platf
+ import { INotificationService, Severity } from '../../platform/notification/common/notification.js';
+ import { IProductService } from '../../platform/product/common/productService.js';
+ import { IStorageService, StorageScope, StorageTarget } from '../../platform/storage/common/storage.js';
++import { ICustomMenu, ICustomMenuEntry } from '../../base/common/product.js';
++import { language } from '../../base/common/platform.js';
+ 
+ export class CodeServerClient extends Disposable {
+ 	static LOGOUT_COMMAND_ID = 'code-server.logout';
++	static CUSTOM_MENU_COMMAND_ID_PREFIX = 'code-server.custom-menu';
+ 
+ 	constructor (
+ 		@ILogService private logService: ILogService,
+@@ -90,6 +93,10 @@ export class CodeServerClient extends Di
+ 			this.addLogoutCommand(this.productService.logoutEndpoint);
+ 		}
+ 
++		if (this.productService.customMenus) {
++			this.addCustomMenus(this.productService.customMenus);
++		}
++
+ 		if (this.productService.serviceWorker) {
+ 			await this.registerServiceWorker(this.productService.serviceWorker);
+ 		}
+@@ -166,6 +173,102 @@ export class CodeServerClient extends Di
+ 		}
+ 	}
+ 
++	private addCustomMenus(customMenus: ReadonlyArray<ICustomMenu>): void {
++		const menuIds = new Map<ICustomMenu['menu'], MenuId>([
++			['file', MenuId.MenubarFileMenu],
++			['go', MenuId.MenubarGoMenu],
++			['help', MenuId.MenubarHelpMenu],
++		]);
++
++		let commandIndex = 0;
++		let topGroupIndex = 0;
++		let bottomGroupIndex = 0;
++
++		// Top groups use the '0_' range: menu groups sort by localeCompare of
++		// their group name, and digits sort before letters, so '0_custom_*'
++		// lands before all native '1_*'..'9_*' groups. The literal
++		// 'navigation' group is special-cased first in menuService, but a
++		// 'navigation_*' prefix does NOT inherit that ordering and would sort
++		// after all native groups. Bottom groups use the 'z_' range (sorted
++		// after '9_*'). A distinct group per group block produces the
++		// separator between blocks and preserves the entry order within each
++		// block.
++		const groupName = (position: 'top' | 'bottom'): string => {
++			return position === 'top' ? `0_custom_${topGroupIndex++}` : `z_custom_${bottomGroupIndex++}`;
++		};
++
++		for (const customMenu of customMenus) {
++			const menuId = menuIds.get(customMenu.menu);
++			if (!menuId) {
++				continue; // validated on the server
++			}
++
++			for (const group of customMenu.groups) {
++				const currentGroup = groupName(group.position);
++				let orderIndex = 0;
++				for (const entry of group.entries) {
++					this.addCustomMenuCommand(CodeServerClient.CUSTOM_MENU_COMMAND_ID_PREFIX + commandIndex++, entry, menuId, currentGroup, orderIndex++);
++				}
++			}
++		}
++	}
++
++	private addCustomMenuCommand(cmdId: string, entry: ICustomMenuEntry, menuId: MenuId, group: string, order: number): void {
++		const title = this.resolveCustomMenuName(entry.names);
++		if (!title) {
++			return;
++		}
++
++		const link = entry.link;
++		CommandsRegistry.registerCommand(cmdId, () => {
++			const customUrl = new URL(link, window.location.href);
++			window.location.assign(customUrl);
++		});
++
++		MenuRegistry.appendMenuItem(menuId, {
++			group,
++			order,
++			command: {
++				id: cmdId,
++				title,
++			},
++		});
++	}
++
++	/**
++	 * Resolve the localized label for the current UI language. Falls back in
++	 * the order: exact locale (zh-cn) -> language (zh) -> any locale ('*') ->
++	 * en -> first declared key.
++	 */
++	private resolveCustomMenuName(names: Record<string, string>): string | undefined {
++		const locale = language.toLowerCase();
++
++		const exact = names[locale];
++		if (exact) {
++			return exact;
++		}
++
++		const languagePrefix = locale.split('-')[0];
++		if (languagePrefix !== locale) {
++			const prefix = names[languagePrefix];
++			if (prefix) {
++				return prefix;
++			}
++		}
++
++		const anyLocale = names['*'];
++		if (anyLocale) {
++			return anyLocale;
++		}
++
++		const english = names['en'];
++		if (english) {
++			return english;
++		}
++
++		return Object.values(names)[0];
++	}
++
+ 	private async registerServiceWorker(serviceWorker: { path: string; scope: string }) {
+ 		if (typeof navigator !== 'undefined' && 'serviceWorker' in navigator) {
+ 			try {
+Index: code-server/src/node/cli.ts
+===================================================================
+--- code-server.orig/src/node/cli.ts
++++ code-server/src/node/cli.ts
+@@ -57,6 +57,7 @@ export interface UserProvidedCodeArgs {
+   "cookie-suffix"?: string
+   "link-protection-trusted-domains"?: string[]
+   "enable-remote-storage"?: boolean
++  "custom-menu-file"?: string
+   // locale is used by both VS Code and code-server.
+   locale?: string
+ }
+@@ -224,6 +225,12 @@ export const options: Options<Required<U
+     description:
+       "Persist browser storage (settings, state, etc.) on the server instead of browser IndexedDB. Enables state portability across browsers/devices.",
+   },
++  "custom-menu-file": {
++    type: "string",
++    path: true,
++    description:
++      "Path to a YAML file that describes custom menu items for the File, Go and Help menus. Each menu item can have a localized name, a link, and a position (top/bottom) within groups.",
++  },
+   open: { type: "boolean", description: "Open in browser on startup. Does not work remotely." },
+ 
+   "bind-addr": {
