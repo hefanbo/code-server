@@ -2,8 +2,8 @@ Index: code-server/lib/vscode/build/gulpfile.extensions.ts
 ===================================================================
 --- code-server.orig/lib/vscode/build/gulpfile.extensions.ts
 +++ code-server/lib/vscode/build/gulpfile.extensions.ts
-@@ -287,6 +287,29 @@ export const compileCopilotExtensionBuil
- gulp.task(compileCopilotExtensionBuildTask);
+@@ -291,6 +291,29 @@ export const compileCopilotExtensionBuil
+ task.task(compileCopilotExtensionBuildTask);
  
  /**
 + * Compiles the built-in copilot extension with proper `.vscodeignore` filtering
@@ -26,7 +26,7 @@ Index: code-server/lib/vscode/build/gulpfile.extensions.ts
 +		return Promise.resolve();
 +	})
 +));
-+gulp.task(compileCopilotExtensionFullBuildTask);
++task.task(compileCopilotExtensionFullBuildTask);
 +
 +/**
   * Compiles the extensions for the build.
@@ -36,15 +36,15 @@ Index: code-server/lib/vscode/build/lib/extensions.ts
 ===================================================================
 --- code-server.orig/lib/vscode/build/lib/extensions.ts
 +++ code-server/lib/vscode/build/lib/extensions.ts
-@@ -24,6 +24,7 @@ import { getProductionDependencies } fro
+@@ -21,6 +21,7 @@ import { getProductionDependencies } fro
  import { type IExtensionDefinition, getExtensionStream } from './builtInExtensions.ts';
  import { fetchUrls, fetchGithub } from './fetch.ts';
  import { createTsgoStream, spawnTsgo } from './tsgo.ts';
-+import { prepareBuiltInCopilotExtensionShims } from './copilot.ts';
- import vzip from 'gulp-vinyl-zip';
++import { prepareBuiltInCopilotRipgrepShim } from './copilot.ts';
+ import watcher from './watch/index.ts';
  
  import { createRequire } from 'module';
-@@ -482,6 +483,116 @@ export function packageCopilotExtensionS
+@@ -491,6 +492,116 @@ export function packageCopilotExtensionS
  	).pipe(util2.setExecutableBit(['**/*.sh']));
  }
  
@@ -61,7 +61,7 @@ Index: code-server/lib/vscode/build/lib/extensions.ts
 +		return es.readArray([]);
 +	}
 +
-+	const esbuildConfigFileName = '.esbuild.ts';
++	const esbuildConfigFileName = '.esbuild.mts';
 +	const esbuildScript = path.join(extensionPath, esbuildConfigFileName);
 +	if (!fs.existsSync(esbuildScript)) {
 +		throw new Error(`Copilot esbuild script not found at ${esbuildScript}`);
@@ -148,7 +148,7 @@ Index: code-server/lib/vscode/build/lib/extensions.ts
 +	}
 +
 +	try {
-+		prepareBuiltInCopilotExtensionShims(platform, arch, outputDir, appNodeModulesDir);
++		prepareBuiltInCopilotRipgrepShim(platform, arch, outputDir, appNodeModulesDir);
 +		fancyLog(`[prepareCopilotExtensionNativeShims] Materialized native shims for ${platform}-${arch}`);
 +	} catch (err) {
 +		// Downgrade to a warning for local builds since the extension
