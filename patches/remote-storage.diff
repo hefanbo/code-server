@@ -1,10 +1,20 @@
-Merge https://github.com/microsoft/vscode/pull/288880/
-feat(server): add remote storage persistence for VS Code Web
+Remote storage persistence for VS Code Web
+
+Persist browser storage (settings, state, etc.) on the server instead of
+browser IndexedDB when `--enable-remote-storage` is specified. This enables
+state portability across browsers/devices.
+
+The browser side reuses the existing `RemoteStorageService` (the storage
+service used by the Electron renderer) by providing it the `storage` channel
+over the remote agent connection, mirroring what we did for display languages.
+The server side is a port of the upstream storage main/channel
+(src/vs/platform/storage/electron-main) that owns the SQLite databases.
+
 Index: code-server/lib/vscode/src/vs/platform/storage/node/storageMain.ts
 ===================================================================
 --- /dev/null
 +++ code-server/lib/vscode/src/vs/platform/storage/node/storageMain.ts
-@@ -0,0 +1,438 @@
+@@ -0,0 +1,500 @@
 +/*---------------------------------------------------------------------------------------------
 + *  Copyright (c) Microsoft Corporation. All rights reserved.
 + *  Licensed under the MIT License. See License.txt in the project root for license information.
@@ -19,7 +29,7 @@ Index: code-server/lib/vscode/src/vs/platform/storage/node/storageMain.ts
 +import { StopWatch } from '../../../base/common/stopwatch.js';
 +import { URI } from '../../../base/common/uri.js';
 +import { Promises } from '../../../base/node/pfs.js';
-+import { InMemoryStorageDatabase, IStorage, Storage, StorageHint, StorageState } from '../../../base/parts/storage/common/storage.js';
++import { InMemoryStorageDatabase, IStorage, Storage, StorageHint, StorageState, MigratingStorage } from '../../../base/parts/storage/common/storage.js';
 +import { ISQLiteStorageDatabaseLoggingOptions, SQLiteStorageDatabase } from '../../../base/parts/storage/node/storage.js';
 +import { IEnvironmentService } from '../../environment/common/environment.js';
 +import { IFileService } from '../../files/common/files.js';
@@ -41,7 +51,7 @@ Index: code-server/lib/vscode/src/vs/platform/storage/node/storageMain.ts
 +
 +/**
 + * Provides access to application, profile and workspace storage from
-+ * a Node.js process that owns storage connections.
++ * the electron-main side that is the owner of all storage connections.
 + */
 +export interface IStorageMain extends IDisposable {
 +
@@ -120,7 +130,7 @@ Index: code-server/lib/vscode/src/vs/platform/storage/node/storageMain.ts
 +	readonly key: string;
 +}
 +
-+export abstract class BaseStorageMain extends Disposable implements IStorageMain {
++abstract class BaseStorageMain extends Disposable implements IStorageMain {
 +
 +	private static readonly LOG_SLOW_CLOSE_THRESHOLD = 2000;
 +
@@ -355,6 +365,68 @@ Index: code-server/lib/vscode/src/vs/platform/storage/node/storageMain.ts
 +	}
 +}
 +
++export class ApplicationSharedStorageMain extends BaseStorageMain {
++
++	private static readonly STORAGE_NAME = 'state.vscdb';
++
++	get path(): string | undefined {
++		if (!this.options.useInMemoryStorage) {
++			return join(this.storageFolderPath, ApplicationSharedStorageMain.STORAGE_NAME);
++		}
++
++		return undefined;
++	}
++
++	constructor(
++		private readonly options: IStorageMainOptions,
++		private readonly storageFolderPath: string,
++		private readonly applicationStorage: IStorageMain,
++		logService: ILogService,
++		fileService: IFileService,
++	) {
++		super(logService, fileService);
++	}
++
++	protected async doCreate(): Promise<Storage> {
++		const { storageFilePath, wasCreated } = await this.prepareStorageFolder();
++
++		this.logService.info(`[shared storage] Creating shared storage database at '${storageFilePath}' (wasCreated: ${wasCreated})`);
++
++		const database = new SQLiteStorageDatabase(storageFilePath, {
++			logging: this.createLoggingOptions()
++		});
++
++		this.logService.info(`[shared storage] Initializing fallback application storage (path: ${this.applicationStorage.path ?? 'in-memory'})`);
++		await this.applicationStorage.init();
++		this.logService.info(`[shared storage] Fallback application storage initialized with ${this.applicationStorage.items.size} items`);
++
++		const migratingStorage = this._register(new MigratingStorage(database, { hint: wasCreated ? StorageHint.STORAGE_DOES_NOT_EXIST : undefined }));
++		migratingStorage.setFallbackStorage(this.applicationStorage.storage, false);
++		return migratingStorage;
++	}
++
++	get applicationStorageItems(): Map<string, string> {
++		return this.applicationStorage.items;
++	}
++
++	private async prepareStorageFolder(): Promise<{ storageFilePath: string; wasCreated: boolean }> {
++		if (this.options.useInMemoryStorage) {
++			return { storageFilePath: SQLiteStorageDatabase.IN_MEMORY_PATH, wasCreated: true };
++		}
++
++		const storageDatabasePath = join(this.storageFolderPath, ApplicationSharedStorageMain.STORAGE_NAME);
++
++		const storageExists = await Promises.exists(this.storageFolderPath);
++		if (storageExists) {
++			return { storageFilePath: storageDatabasePath, wasCreated: false };
++		}
++
++		await fs.promises.mkdir(this.storageFolderPath, { recursive: true });
++
++		return { storageFilePath: storageDatabasePath, wasCreated: true };
++	}
++}
++
 +export class WorkspaceStorageMain extends BaseStorageMain {
 +
 +	private static readonly WORKSPACE_STORAGE_NAME = 'state.vscdb';
@@ -447,7 +519,7 @@ Index: code-server/lib/vscode/src/vs/server/node/serverEnvironmentService.ts
 ===================================================================
 --- code-server.orig/lib/vscode/src/vs/server/node/serverEnvironmentService.ts
 +++ code-server/lib/vscode/src/vs/server/node/serverEnvironmentService.ts
-@@ -65,6 +65,7 @@ export const serverOptions: OptionDescri
+@@ -66,6 +66,7 @@ export const serverOptions: OptionDescri
  	'enable-sync': { type: 'boolean' },
  	'github-auth': { type: 'string' },
  	'use-test-resolver': { type: 'boolean' },
@@ -455,19 +527,19 @@ Index: code-server/lib/vscode/src/vs/server/node/serverEnvironmentService.ts
  
  	/* ----- extension management ----- */
  
-@@ -206,6 +207,7 @@ export interface ServerParsedArgs {
- 	'enable-sync'?: boolean;
- 	'github-auth'?: string;
- 	'use-test-resolver'?: boolean;
-+	'enable-remote-storage'?: boolean;
+@@ -126,6 +127,7 @@ export interface ServerParsedArgs {
+ 	'locale'?: string
+ 	'link-protection-trusted-domains'?: string[],
+ 	'app-name'?: string,
++	'enable-remote-storage'?: boolean,
  
- 	/* ----- extension management ----- */
+ 	/* ----- server setup ----- */
  
 Index: code-server/lib/vscode/src/vs/server/node/serverServices.ts
 ===================================================================
 --- code-server.orig/lib/vscode/src/vs/server/node/serverServices.ts
 +++ code-server/lib/vscode/src/vs/server/node/serverServices.ts
-@@ -103,6 +103,8 @@ import { IMcpGalleryManifestService } fr
+@@ -107,6 +107,8 @@ import { IMcpGalleryManifestService } fr
  import { McpGalleryManifestIPCService } from '../../platform/mcp/common/mcpGalleryManifestServiceIpc.js';
  import { SANDBOX_HELPER_CHANNEL_NAME, SandboxHelperChannel } from '../../platform/sandbox/common/sandboxHelperIpc.js';
  import { SandboxHelperService } from '../../platform/sandbox/node/sandboxHelper.js';
@@ -476,7 +548,7 @@ Index: code-server/lib/vscode/src/vs/server/node/serverServices.ts
  
  const eventPrefix = 'monacoworkbench';
  
-@@ -232,6 +234,7 @@ export async function setupServerService
+@@ -236,6 +238,7 @@ export async function setupServerService
  	services.set(INativeServerExtensionManagementService, new SyncDescriptor(ExtensionManagementService));
  	services.set(INativeMcpDiscoveryHelperService, new SyncDescriptor(NativeMcpDiscoveryHelperService));
  	services.set(IMcpGatewayService, new SyncDescriptor(McpGatewayService));
@@ -484,14 +556,16 @@ Index: code-server/lib/vscode/src/vs/server/node/serverServices.ts
  
  	const instantiationService: IInstantiationService = new InstantiationService(services);
  	services.set(ILanguagePackService, instantiationService.createInstance(NativeLanguagePackService));
-@@ -304,6 +307,11 @@ export async function setupServerService
+@@ -420,6 +423,13 @@ export async function setupServerService
  		const languagePackChannel = ProxyChannel.fromService<RemoteAgentConnectionContext>(accessor.get(ILanguagePackService), disposables);
  		socketServer.registerChannel('languagePacks', languagePackChannel);
  
-+		// Storage channel for remote storage persistence
-+		const serverStorageMainService = accessor.get(IServerStorageMainService);
-+		const storageChannel = disposables.add(new ServerStorageDatabaseChannel(logService, serverStorageMainService));
-+		socketServer.registerChannel('storage', storageChannel);
++		// Storage channel for remote storage persistence (only when enabled)
++		if (args['enable-remote-storage']) {
++			const serverStorageMainService = accessor.get(IServerStorageMainService);
++			const storageChannel = disposables.add(new ServerStorageDatabaseChannel(logService, serverStorageMainService));
++			socketServer.registerChannel('storage', storageChannel);
++		}
 +
  		// clean up extensions folder
  		remoteExtensionsScanner.whenExtensionsReady().then(() => extensionManagementService.cleanUp());
@@ -500,7 +574,7 @@ Index: code-server/lib/vscode/src/vs/server/node/serverStorageIpc.ts
 ===================================================================
 --- /dev/null
 +++ code-server/lib/vscode/src/vs/server/node/serverStorageIpc.ts
-@@ -0,0 +1,165 @@
+@@ -0,0 +1,204 @@
 +/*---------------------------------------------------------------------------------------------
 + *  Copyright (c) Microsoft Corporation. All rights reserved.
 + *  Licensed under the MIT License. See License.txt in the project root for license information.
@@ -511,17 +585,22 @@ Index: code-server/lib/vscode/src/vs/server/node/serverStorageIpc.ts
 +import { revive } from '../../base/common/marshalling.js';
 +import { IServerChannel } from '../../base/parts/ipc/common/ipc.js';
 +import { ILogService } from '../../platform/log/common/log.js';
-+import { IBaseSerializableStorageRequest, ISerializableItemsChangeEvent, ISerializableUpdateRequest, Key, Value } from '../../platform/storage/common/storageIpc.js';
-+import { IStorageMain, IStorageChangeEvent } from '../../platform/storage/node/storageMain.js';
++import { IBaseSerializableStorageRequest, ISerializableCompareAndSwapRequest, ISerializableCompareAndSwapResult, ISerializableGetValueRequest, ISerializableItemsChangeEvent, ISerializableUpdateRequest, Key, Value } from '../../platform/storage/common/storageIpc.js';
++import { ApplicationSharedStorageMain, IStorageChangeEvent, IStorageMain } from '../../platform/storage/node/storageMain.js';
 +import { IServerStorageMainService } from './storageMainService.js';
 +import { IUserDataProfile } from '../../platform/userDataProfile/common/userDataProfile.js';
 +import { reviveIdentifier, IAnyWorkspaceIdentifier } from '../../platform/workspace/common/workspace.js';
 +
++/**
++ * Port of `StorageDatabaseChannel` (src/vs/platform/storage/electron-main/storageIpc.ts) for the
++ * server process. Kept in sync with the upstream file so that upgrades only require re-porting.
++ */
 +export class ServerStorageDatabaseChannel extends Disposable implements IServerChannel {
 +
 +	private static readonly STORAGE_CHANGE_DEBOUNCE_TIME = 100;
 +
 +	private readonly onDidChangeApplicationStorageEmitter = this._register(new Emitter<ISerializableItemsChangeEvent>());
++	private readonly onDidChangeApplicationSharedStorageEmitter = this._register(new Emitter<ISerializableItemsChangeEvent>());
 +
 +	private readonly mapProfileToOnDidChangeProfileStorageEmitter = new Map<string /* profile ID */, Emitter<ISerializableItemsChangeEvent>>();
 +
@@ -532,6 +611,7 @@ Index: code-server/lib/vscode/src/vs/server/node/serverStorageIpc.ts
 +		super();
 +
 +		this.registerStorageChangeListeners(storageMainService.applicationStorage, this.onDidChangeApplicationStorageEmitter);
++		this.registerStorageChangeListeners(storageMainService.applicationSharedStorage, this.onDidChangeApplicationSharedStorageEmitter);
 +	}
 +
 +	//#region Storage Change Events
@@ -580,8 +660,12 @@ Index: code-server/lib/vscode/src/vs/server/node/serverStorageIpc.ts
 +			case 'onDidChangeStorage': {
 +				const profile = arg.profile ? revive<IUserDataProfile>(arg.profile) : undefined;
 +
-+				// Without profile: application scope
++				// Without profile: application or application-shared scope
 +				if (!profile) {
++					if (arg.applicationShared) {
++						return this.onDidChangeApplicationSharedStorageEmitter.event;
++					}
++
 +					return this.onDidChangeApplicationStorageEmitter.event;
 +				}
 +
@@ -606,14 +690,28 @@ Index: code-server/lib/vscode/src/vs/server/node/serverStorageIpc.ts
 +	async call(_: unknown, command: string, arg: IBaseSerializableStorageRequest): Promise<any> {
 +		const profile = arg.profile ? revive<IUserDataProfile>(arg.profile) : undefined;
 +		const workspace = reviveIdentifier(arg.workspace);
++		const applicationShared = arg.applicationShared;
 +
 +		// Get storage to be ready
-+		const storage = await this.withStorageInitialized(profile, workspace);
++		const storage = await this.withStorageInitialized(profile, workspace, applicationShared);
 +
 +		// handle call
 +		switch (command) {
 +			case 'getItems': {
-+				return Array.from(storage.items.entries());
++				const items = new Map(storage.items);
++				return Array.from(items.entries());
++			}
++
++			case 'getValue': {
++				const request = arg as ISerializableGetValueRequest;
++				return storage.get(request.key);
++			}
++
++			case 'getFallbackApplicationStorageItems': {
++				if (storage instanceof ApplicationSharedStorageMain) {
++					return Array.from(storage.applicationStorageItems.entries());
++				}
++				return [];
 +			}
 +
 +			case 'updateItems': {
@@ -628,6 +726,19 @@ Index: code-server/lib/vscode/src/vs/server/node/serverStorageIpc.ts
 +				items.delete?.forEach(key => storage.delete(key));
 +
 +				break;
++			}
++
++			case 'compareAndSwap': {
++				const request = arg as ISerializableCompareAndSwapRequest;
++				const currentValue = storage.get(request.key);
++				if (currentValue !== request.expectedValue) {
++					const result: ISerializableCompareAndSwapResult = { swapped: false, currentValue };
++					return result;
++				}
++
++				storage.set(request.key, request.newValue);
++				const result: ISerializableCompareAndSwapResult = { swapped: true, currentValue: request.newValue };
++				return result;
 +			}
 +
 +			case 'optimize': {
@@ -647,12 +758,14 @@ Index: code-server/lib/vscode/src/vs/server/node/serverStorageIpc.ts
 +		}
 +	}
 +
-+	private async withStorageInitialized(profile: IUserDataProfile | undefined, workspace: IAnyWorkspaceIdentifier | undefined): Promise<IStorageMain> {
++	private async withStorageInitialized(profile: IUserDataProfile | undefined, workspace: IAnyWorkspaceIdentifier | undefined, applicationShared?: boolean): Promise<IStorageMain> {
 +		let storage: IStorageMain;
 +		if (workspace) {
 +			storage = this.storageMainService.workspaceStorage(workspace);
 +		} else if (profile) {
 +			storage = this.storageMainService.profileStorage(profile);
++		} else if (applicationShared) {
++			storage = this.storageMainService.applicationSharedStorage;
 +		} else {
 +			storage = this.storageMainService.applicationStorage;
 +		}
@@ -660,7 +773,7 @@ Index: code-server/lib/vscode/src/vs/server/node/serverStorageIpc.ts
 +		try {
 +			await storage.init();
 +		} catch (error) {
-+			this.logService.error(`ServerStorageIPC#init: Unable to init ${workspace ? 'workspace' : profile ? 'profile' : 'application'} storage due to ${error}`);
++			this.logService.error(`ServerStorageIPC#init: Unable to init ${workspace ? 'workspace' : profile ? 'profile' : applicationShared ? 'application-shared' : 'application'} storage due to ${error}`);
 +		}
 +
 +		return storage;
@@ -670,7 +783,7 @@ Index: code-server/lib/vscode/src/vs/server/node/storageMainService.ts
 ===================================================================
 --- /dev/null
 +++ code-server/lib/vscode/src/vs/server/node/storageMainService.ts
-@@ -0,0 +1,205 @@
+@@ -0,0 +1,238 @@
 +/*---------------------------------------------------------------------------------------------
 + *  Copyright (c) Microsoft Corporation. All rights reserved.
 + *  Licensed under the MIT License. See License.txt in the project root for license information.
@@ -678,13 +791,15 @@ Index: code-server/lib/vscode/src/vs/server/node/storageMainService.ts
 +
 +import { Emitter, Event } from '../../base/common/event.js';
 +import { Disposable } from '../../base/common/lifecycle.js';
++import { Schemas } from '../../base/common/network.js';
++import { join } from '../../base/common/path.js';
 +import { createDecorator } from '../../platform/instantiation/common/instantiation.js';
 +import { ILogService } from '../../platform/log/common/log.js';
 +import { IFileService } from '../../platform/files/common/files.js';
 +import { IEnvironmentService } from '../../platform/environment/common/environment.js';
 +import { IUserDataProfilesService, IUserDataProfile } from '../../platform/userDataProfile/common/userDataProfile.js';
 +import { isProfileUsingDefaultStorage } from '../../platform/storage/common/storage.js';
-+import { IStorageMain, IStorageMainOptions, IStorageChangeEvent, ApplicationStorageMain, ProfileStorageMain, WorkspaceStorageMain } from '../../platform/storage/node/storageMain.js';
++import { IStorageMain, IStorageMainOptions, IStorageChangeEvent, ApplicationStorageMain, ApplicationSharedStorageMain, ProfileStorageMain, WorkspaceStorageMain } from '../../platform/storage/node/storageMain.js';
 +import { IAnyWorkspaceIdentifier } from '../../platform/workspace/common/workspace.js';
 +
 +//#region Server Storage Main Service
@@ -705,6 +820,12 @@ Index: code-server/lib/vscode/src/vs/server/node/storageMainService.ts
 +	 * windows and all profiles.
 +	 */
 +	readonly applicationStorage: IStorageMain;
++
++	/**
++	 * Provides access to the application shared storage that is shared
++	 * across VS Code and Agents app.
++	 */
++	readonly applicationSharedStorage: IStorageMain;
 +
 +	/**
 +	 * Emitted whenever data is updated or deleted in profile scoped storage.
@@ -738,6 +859,7 @@ Index: code-server/lib/vscode/src/vs/server/node/storageMainService.ts
 +	readonly onDidChangeProfileStorage = this._onDidChangeProfileStorage.event;
 +
 +	readonly applicationStorage: IStorageMain;
++	readonly applicationSharedStorage: IStorageMain;
 +
 +	constructor(
 +		@ILogService private readonly logService: ILogService,
@@ -748,6 +870,7 @@ Index: code-server/lib/vscode/src/vs/server/node/storageMainService.ts
 +		super();
 +
 +		this.applicationStorage = this._register(this.createApplicationStorage());
++		this.applicationSharedStorage = this._register(this.createApplicationSharedStorage());
 +
 +		this.registerListeners();
 +	}
@@ -759,8 +882,11 @@ Index: code-server/lib/vscode/src/vs/server/node/storageMainService.ts
 +	}
 +
 +	private registerListeners(): void {
-+		// Initialize application storage immediately
++
++		// Initialize application storage immediately so that the
++		// shared storage can fall back to it on initialization.
 +		this.applicationStorage.init();
++		this.applicationSharedStorage.init();
 +
 +		// Listen for profile changes
 +		this._register(this.userDataProfilesService.onDidChangeProfiles(e => {
@@ -796,6 +922,26 @@ Index: code-server/lib/vscode/src/vs/server/node/storageMainService.ts
 +		}));
 +
 +		return applicationStorage;
++	}
++
++	//#endregion
++
++	//#region Application Shared Storage
++
++	private createApplicationSharedStorage(): IStorageMain {
++		this.logService.info(`ServerStorageMainService: creating application shared storage`);
++
++		const sharedStorageFolderPath = join(this.environmentService.appSharedDataHome.with({ scheme: Schemas.file }).fsPath, 'sharedStorage');
++
++		// Use the application storage as fallback for transparent migration
++		// of keys from APPLICATION to APPLICATION_SHARED scope.
++		const applicationSharedStorage = new ApplicationSharedStorageMain(this.getStorageOptions(), sharedStorageFolderPath, this.applicationStorage, this.logService, this.fileService);
++
++		this._register(Event.once(applicationSharedStorage.onDidCloseStorage)(() => {
++			this.logService.trace(`ServerStorageMainService: closed application shared storage`);
++		}));
++
++		return applicationSharedStorage;
 +	}
 +
 +	//#endregion
@@ -839,7 +985,6 @@ Index: code-server/lib/vscode/src/vs/server/node/storageMainService.ts
 +
 +	//#endregion
 +
-+
 +	//#region Workspace Storage
 +
 +	private readonly mapWorkspaceToStorage = new Map<string /* workspace ID */, IStorageMain>();
@@ -869,8 +1014,9 @@ Index: code-server/lib/vscode/src/vs/server/node/storageMainService.ts
 +	//#endregion
 +
 +	isUsed(path: string): boolean {
-+		// For server, we don't need to track file usage like the electron-main service
-+		// This is primarily used for external file operations in the desktop app
++		// For the server we do not need to track file usage like the
++		// electron-main service since this is primarily used for external
++		// file operations in the desktop app.
 +		return false;
 +	}
 +}
@@ -880,7 +1026,7 @@ Index: code-server/lib/vscode/src/vs/server/node/webClientServer.ts
 ===================================================================
 --- code-server.orig/lib/vscode/src/vs/server/node/webClientServer.ts
 +++ code-server/lib/vscode/src/vs/server/node/webClientServer.ts
-@@ -411,7 +411,8 @@ export class WebClientServer {
+@@ -410,7 +410,8 @@ export class WebClientServer {
  			folderUri: resolveWorkspaceURI(this._environmentService.args['default-folder']),
  			workspaceUri: resolveWorkspaceURI(this._environmentService.args['default-workspace']),
  			productConfiguration,
@@ -890,11 +1036,24 @@ Index: code-server/lib/vscode/src/vs/server/node/webClientServer.ts
  		};
  
  		const cookies = cookie.parse(req.headers.cookie || '');
+Index: code-server/lib/vscode/src/vs/sessions/browser/web.main.ts
+===================================================================
+--- code-server.orig/lib/vscode/src/vs/sessions/browser/web.main.ts
++++ code-server/lib/vscode/src/vs/sessions/browser/web.main.ts
+@@ -82,7 +82,7 @@ export class SessionsBrowserMain extends
+ 		serviceCollection.set(IWorkbenchConfigurationService, configurationService);
+ 
+ 		// Storage
+-		const storageService = await this.createStorageService(workspaceIdentifier, logService, userDataProfileService);
++		const storageService = await this.createStorageService(workspaceIdentifier, logService, userDataProfileService, _userDataProfilesService, _remoteAgentService, environmentService);
+ 		serviceCollection.set(IStorageService, storageService);
+ 
+ 		// Workspace Trust Service
 Index: code-server/lib/vscode/src/vs/workbench/browser/web.api.ts
 ===================================================================
 --- code-server.orig/lib/vscode/src/vs/workbench/browser/web.api.ts
 +++ code-server/lib/vscode/src/vs/workbench/browser/web.api.ts
-@@ -411,6 +411,19 @@ export interface IWorkbenchConstructionO
+@@ -418,6 +418,19 @@ export interface IWorkbenchConstructionO
  
  	//#endregion
  
@@ -918,35 +1077,92 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/web.main.ts
 ===================================================================
 --- code-server.orig/lib/vscode/src/vs/workbench/browser/web.main.ts
 +++ code-server/lib/vscode/src/vs/workbench/browser/web.main.ts
-@@ -33,7 +33,7 @@ import { ConfigurationCache } from '../s
- import { ISignService } from '../../platform/sign/common/sign.js';
+@@ -33,7 +33,12 @@ import { ISignService } from '../../plat
  import { SignService } from '../../platform/sign/browser/signService.js';
  import { IWorkbenchConstructionOptions, IWorkbench, IWorkspace, ITunnel } from './web.api.js';
--import { BrowserStorageService } from '../services/storage/browser/storageService.js';
-+import { BrowserStorageService, RemoteBrowserStorageService } from '../services/storage/browser/storageService.js';
+ import { BrowserStorageService } from '../services/storage/browser/storageService.js';
++import { RemoteStorageService } from '../../platform/storage/common/storageService.js';
  import { IStorageService } from '../../platform/storage/common/storage.js';
++import { IRemoteService } from '../../platform/ipc/common/services.js';
++import { IChannel, IServerChannel } from '../../base/parts/ipc/common/ipc.js';
++import { IRemoteAgentConnection } from '../services/remote/common/remoteAgentService.js';
++import { IEnvironmentService } from '../../platform/environment/common/environment.js';
  import { toLocalISOString } from '../../base/common/date.js';
  import { isWorkspaceToOpen, isFolderToOpen } from '../../platform/window/common/window.js';
-@@ -384,7 +384,7 @@ export class BrowserMain extends Disposa
+ import { getSingleFolderWorkspaceIdentifier, getWorkspaceIdentifier } from '../../platform/workspaces/common/workspaceIdentifier.js';
+@@ -107,6 +112,51 @@ export interface IBrowserMainWorkbench {
+ 	readonly onDidShutdown: Event<void>;
+ }
+ 
++/**
++ * Adapts the remote agent connection to the `IRemoteService` interface so that
++ * the existing `RemoteStorageService` (the storage service used by the Electron
++ * renderer) can be reused to persist storage on the remote server.
++ */
++class RemoteAgentConnectionService implements IRemoteService {
++
++	declare readonly _serviceBrand: undefined;
++
++	constructor(private readonly connection: IRemoteAgentConnection) { }
++
++	getChannel(channelName: string): IChannel {
++		return this.connection.getChannel(channelName);
++	}
++
++	registerChannel(channelName: string, channel: IServerChannel<string>): void {
++		throw new Error('Not supported');
++	}
++}
++
++/**
++ * Thin wrapper around `RemoteStorageService` that wires up profile switching,
++ * mirroring `NativeWorkbenchStorageService` on desktop. Reuses the common
++ * storage implementation instead of duplicating it.
++ */
++class RemoteStorageServiceWithProfiles extends RemoteStorageService {
++
++	constructor(
++		workspace: IAnyWorkspaceIdentifier | undefined,
++		userDataProfileService: IUserDataProfileService,
++		userDataProfilesService: IUserDataProfilesService,
++		remoteService: IRemoteService,
++		environmentService: IEnvironmentService
++	) {
++		super(
++			workspace,
++			{ defaultProfile: userDataProfilesService.defaultProfile, currentProfile: userDataProfileService.currentProfile },
++			remoteService,
++			environmentService
++		);
++
++		this._register(userDataProfileService.onDidChangeCurrentProfile(e => e.join(this.switchToProfile(e.profile))));
++	}
++}
++
+ export class BrowserMain extends Disposable {
+ 
+ 	private readonly onWillShutdownDisposables = this._register(new DisposableStore());
+@@ -478,7 +528,7 @@ export class BrowserMain extends Disposa
+ 				serviceCollection.set(IWorkbenchConfigurationService, service);
  				return service;
  			}),
- 
 -			this.createStorageService(workspace, logService, userDataProfileService).then(service => {
-+			this.createStorageService(workspace, logService, userDataProfileService, remoteAgentService).then(service => {
- 
- 				// Storage
++			this.createStorageService(workspace, logService, userDataProfileService, userDataProfilesService, remoteAgentService, environmentService).then(service => {
  				serviceCollection.set(IStorageService, service);
-@@ -558,7 +558,28 @@ export class BrowserMain extends Disposa
+ 				return service;
+ 			})
+@@ -600,7 +650,29 @@ export class BrowserMain extends Disposa
  		}));
  	}
  
--	private async createStorageService(workspace: IAnyWorkspaceIdentifier, logService: ILogService, userDataProfileService: IUserDataProfileService): Promise<IStorageService> {
-+	private async createStorageService(workspace: IAnyWorkspaceIdentifier, logService: ILogService, userDataProfileService: IUserDataProfileService, remoteAgentService: IRemoteAgentService): Promise<IStorageService> {
+-	protected async createStorageService(workspace: IAnyWorkspaceIdentifier, logService: ILogService, userDataProfileService: IUserDataProfileService): Promise<IStorageService> {
++	protected async createStorageService(workspace: IAnyWorkspaceIdentifier, logService: ILogService, userDataProfileService: IUserDataProfileService, userDataProfilesService: BrowserUserDataProfilesService, remoteAgentService: IRemoteAgentService, environmentService: IBrowserWorkbenchEnvironmentService): Promise<IStorageService> {
 +		// Use remote storage if enabled and connected to a remote server
 +		const connection = remoteAgentService.getConnection();
 +		if (this.configuration.remoteStorageEnabled && connection) {
 +			logService.info('Using remote storage service for browser state persistence');
-+			const storageService = new RemoteBrowserStorageService(workspace, userDataProfileService, connection, logService);
++
++			const storageService = new RemoteStorageServiceWithProfiles(workspace, userDataProfileService, userDataProfilesService, new RemoteAgentConnectionService(connection), environmentService);
 +
 +			try {
 +				await storageService.initialize();
@@ -966,208 +1182,6 @@ Index: code-server/lib/vscode/src/vs/workbench/browser/web.main.ts
  		const storageService = new BrowserStorageService(workspace, userDataProfileService, logService);
  
  		try {
-Index: code-server/lib/vscode/src/vs/workbench/services/storage/browser/storageService.ts
-===================================================================
---- code-server.orig/lib/vscode/src/vs/workbench/services/storage/browser/storageService.ts
-+++ code-server/lib/vscode/src/vs/workbench/services/storage/browser/storageService.ts
-@@ -18,6 +18,8 @@ import { AbstractStorageService, isProfi
- import { isUserDataProfile, IUserDataProfile } from '../../../../platform/userDataProfile/common/userDataProfile.js';
- import { IAnyWorkspaceIdentifier } from '../../../../platform/workspace/common/workspace.js';
- import { IUserDataProfileService } from '../../userDataProfile/common/userDataProfile.js';
-+import { ApplicationStorageDatabaseClient, ProfileStorageDatabaseClient, WorkspaceStorageDatabaseClient } from '../../../../platform/storage/common/storageIpc.js';
-+import { IRemoteAgentConnection } from '../../remote/common/remoteAgentService.js';
- import { hash } from '../../../../base/common/hash.js';
- 
- export class BrowserStorageService extends AbstractStorageService {
-@@ -460,3 +462,188 @@ export class IndexedDBStorageDatabase ex
- 		await db.runInTransaction(IndexedDBStorageDatabase.STORAGE_OBJECT_STORE, 'readwrite', objectStore => objectStore.clear());
- 	}
- }
-+
-+/**
-+ * Storage service that uses the remote server for persistence via IPC,
-+ * instead of browser IndexedDB. Enabled via the `remoteStorageEnabled` option.
-+ */
-+export class RemoteBrowserStorageService extends AbstractStorageService {
-+
-+	// private readonly applicationStorageProfile: IUserDataProfile;
-+
-+	private readonly applicationStorage: IStorage;
-+
-+	private profileStorageProfile: IUserDataProfile;
-+	private readonly profileStorageDisposables = this._register(new DisposableStore());
-+	private profileStorage: IStorage;
-+
-+	private workspaceStorageId: string | undefined;
-+	private readonly workspaceStorageDisposables = this._register(new DisposableStore());
-+	private workspaceStorage: IStorage | undefined;
-+
-+	constructor(
-+		private readonly workspace: IAnyWorkspaceIdentifier,
-+		private readonly userDataProfileService: IUserDataProfileService,
-+		private readonly connection: IRemoteAgentConnection,
-+		@ILogService private readonly logService: ILogService,
-+	) {
-+		super();
-+
-+
-+		this.applicationStorage = this.createApplicationStorage();
-+
-+		this.profileStorageProfile = this.userDataProfileService.currentProfile;
-+		this.profileStorage = this.createProfileStorage(this.profileStorageProfile);
-+
-+		this.workspaceStorageId = this.workspace.id;
-+		this.workspaceStorage = this.createWorkspaceStorage(this.workspace);
-+
-+		this.registerListeners();
-+	}
-+
-+	private registerListeners(): void {
-+		this._register(this.userDataProfileService.onDidChangeCurrentProfile(e => e.join(this.switchToProfile(e.profile))));
-+	}
-+
-+	private createApplicationStorage(): IStorage {
-+		const storageDataBaseClient = this._register(new ApplicationStorageDatabaseClient(this.connection.getChannel('storage')));
-+		const applicationStorage = this._register(new Storage(storageDataBaseClient));
-+
-+		this._register(applicationStorage.onDidChangeStorage(e => this.emitDidChangeValue(StorageScope.APPLICATION, e)));
-+
-+		return applicationStorage;
-+	}
-+
-+	private createProfileStorage(profile: IUserDataProfile): IStorage {
-+
-+		// First clear any previously associated disposables
-+		this.profileStorageDisposables.clear();
-+
-+		// Remember profile associated to profile storage
-+		this.profileStorageProfile = profile;
-+
-+		let profileStorage: IStorage;
-+		if (isProfileUsingDefaultStorage(profile)) {
-+
-+			// If we are using default profile storage, the profile storage is
-+			// actually the same as application storage. As such we
-+			// avoid creating the storage library a second time on
-+			// the same DB.
-+
-+			profileStorage = this.applicationStorage;
-+		} else {
-+			const storageDataBaseClient = this.profileStorageDisposables.add(new ProfileStorageDatabaseClient(this.connection.getChannel('storage'), profile));
-+			profileStorage = this.profileStorageDisposables.add(new Storage(storageDataBaseClient));
-+		}
-+
-+		this.profileStorageDisposables.add(profileStorage.onDidChangeStorage(e => this.emitDidChangeValue(StorageScope.PROFILE, e)));
-+
-+		return profileStorage;
-+	}
-+
-+	private createWorkspaceStorage(workspace: IAnyWorkspaceIdentifier): IStorage | undefined {
-+
-+		// First clear any previously associated disposables
-+		this.workspaceStorageDisposables.clear();
-+
-+		// Remember workspace ID for logging later
-+		this.workspaceStorageId = workspace?.id;
-+
-+		let workspaceStorage: IStorage | undefined = undefined;
-+		if (workspace) {
-+			const storageDataBaseClient = this.workspaceStorageDisposables.add(new WorkspaceStorageDatabaseClient(this.connection.getChannel('storage'), workspace));
-+			workspaceStorage = this.workspaceStorageDisposables.add(new Storage(storageDataBaseClient));
-+
-+			this.workspaceStorageDisposables.add(workspaceStorage.onDidChangeStorage(e => this.emitDidChangeValue(StorageScope.WORKSPACE, e)));
-+		}
-+
-+		return workspaceStorage;
-+	}
-+
-+	protected async doInitialize(): Promise<void> {
-+
-+		// Init all storage locations
-+		await Promises.settled([
-+			this.applicationStorage.init(),
-+			this.profileStorage.init(),
-+			this.workspaceStorage?.init() ?? Promise.resolve()
-+		]);
-+	}
-+
-+	protected getStorage(scope: StorageScope): IStorage | undefined {
-+		switch (scope) {
-+			case StorageScope.APPLICATION:
-+				return this.applicationStorage;
-+			case StorageScope.PROFILE:
-+				return this.profileStorage;
-+			default:
-+				return this.workspaceStorage;
-+		}
-+	}
-+
-+	protected getLogDetails(scope: StorageScope): string | undefined {
-+		switch (scope) {
-+			case StorageScope.APPLICATION:
-+				return 'Remote Application Storage';
-+			case StorageScope.PROFILE:
-+				return `Remote Profile Storage (${this.profileStorageProfile.name})`;
-+			default:
-+				return this.workspaceStorageId ? `Remote Workspace Storage (${this.workspaceStorageId})` : undefined;
-+		}
-+	}
-+
-+	protected async switchToProfile(toProfile: IUserDataProfile): Promise<void> {
-+		if (!this.canSwitchProfile(this.profileStorageProfile, toProfile)) {
-+			return;
-+		}
-+
-+		const oldProfileStorage = this.profileStorage;
-+		const oldItems = oldProfileStorage.items;
-+
-+		// Close old profile storage but only if this is
-+		// different from application storage!
-+		if (oldProfileStorage !== this.applicationStorage) {
-+			await oldProfileStorage.close();
-+		}
-+
-+		// Create new profile storage & init
-+		this.profileStorage = this.createProfileStorage(toProfile);
-+		await this.profileStorage.init();
-+
-+		// Handle data switch and eventing
-+		this.switchData(oldItems, this.profileStorage, StorageScope.PROFILE);
-+	}
-+
-+	protected async switchToWorkspace(toWorkspace: IAnyWorkspaceIdentifier, preserveData: boolean): Promise<void> {
-+		const oldWorkspaceStorage = this.workspaceStorage;
-+		const oldItems = oldWorkspaceStorage?.items ?? new Map();
-+
-+		// Close old workspace storage
-+		await oldWorkspaceStorage?.close();
-+
-+		// Create new workspace storage & init
-+		this.workspaceStorage = this.createWorkspaceStorage(toWorkspace);
-+		await this.workspaceStorage?.init();
-+
-+		// Handle data switch and eventing
-+		if (this.workspaceStorage) {
-+			this.switchData(oldItems, this.workspaceStorage, StorageScope.WORKSPACE);
-+		}
-+	}
-+
-+	hasScope(scope: IAnyWorkspaceIdentifier | IUserDataProfile): boolean {
-+		if (isUserDataProfile(scope)) {
-+			return this.profileStorageProfile.id === scope.id;
-+		}
-+
-+		return this.workspaceStorageId === scope.id;
-+	}
-+
-+	close(): void {
-+		this.logService.trace('RemoteBrowserStorageService#close()');
-+
-+		// Always dispose to ensure that no timeouts or callbacks
-+		// get triggered in this phase.
-+		this.dispose();
-+	}
-+}
 Index: code-server/src/node/cli.ts
 ===================================================================
 --- code-server.orig/src/node/cli.ts
@@ -1180,15 +1194,15 @@ Index: code-server/src/node/cli.ts
    // locale is used by both VS Code and code-server.
    locale?: string
  }
-@@ -303,6 +304,11 @@ export const options: Options<Required<U
-     description: "Text to show on login page",
-     deprecated: true,
+@@ -218,6 +219,11 @@ export const options: Options<Required<U
+       https://en.wikipedia.org/wiki/IETF_language_tag
+     `,
    },
-+	"enable-remote-storage": {
++  "enable-remote-storage": {
 +    type: "boolean",
-+    short: "rs",
-+    description: "Persist browser storage (settings, state, etc.) on the server instead of browser IndexedDB. Enables state portability across browsers/devices."
++    description:
++      "Persist browser storage (settings, state, etc.) on the server instead of browser IndexedDB. Enables state portability across browsers/devices.",
 +  },
-   "abs-proxy-base-path": {
-     type: "string",
-     description: "The base path to prefix to all absproxy requests",
+   open: { type: "boolean", description: "Open in browser on startup. Does not work remotely." },
+ 
+   "bind-addr": {
