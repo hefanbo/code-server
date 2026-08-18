@@ -23,3 +23,5 @@ display-language.diff
 trusted-domains.diff
 signature-verification.diff
 copilot.diff
+remote-storage.diff
+remote-secret-storage.diff
